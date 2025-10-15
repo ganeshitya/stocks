@@ -1,0 +1,4 @@
+# .streamlit/config.toml
+
+[cli]
+python = "3.11"
