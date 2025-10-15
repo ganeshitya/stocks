@@ -2,6 +2,7 @@ streamlit
 yfinance
 pandas
 numpy
+pandas-datareader
 requests
 ta
 plotly
