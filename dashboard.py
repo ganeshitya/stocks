@@ -5,10 +5,10 @@ import yfinance as yf
 import plotly.express as px
 import plotly.graph_objects as go
 from scipy.stats import percentileofscore
-import time # Used for simulated loading in the UI
+import time 
 
 # --- Configuration ---
-st.set_page_config(layout="wide", page_title="Integrated Expert Screener")
+st.set_page_config(layout="wide", page_title="India Stocks Expert Screener (.NS)")
 
 # --- Global State & Session Variables (Mimicking Existing App Flow) ---
 if 'tickers' not in st.session_state:
@@ -30,8 +30,7 @@ def fetch_data(tickers):
     if not tickers:
         return None
 
-    # Fetch price data for the last 1 year (for returns and technicals)
-    # Fetch 1 year + a buffer for accurate 12M lookbacks
+    # Fetch price data for the last 15 months
     price_data = yf.download(tickers, period="15mo", interval="1d", group_by='ticker', progress=False)
 
     data = {}
@@ -40,21 +39,25 @@ def fetch_data(tickers):
             # Get current info (P/E, Market Cap, etc.)
             stock = yf.Ticker(ticker)
             info = stock.info
-
-            # Get 1-year price series
-            if len(tickers) == 1:
-                price_hist = price_data['Close']
-            else:
-                # Handle multi-index if fetching multiple tickers
+            
+            price_hist = None
+            
+            # --- Robust Price Data Extraction ---
+            if len(tickers) == 1 and isinstance(price_data, pd.DataFrame):
+                # Single ticker format
+                if 'Close' in price_data.columns:
+                    price_hist = price_data['Close']
+            
+            elif isinstance(price_data, pd.DataFrame) and price_data.columns.nlevels > 1:
+                # Multi-ticker format
                 if ticker in price_data.columns.get_level_values(0):
-                    price_hist = price_data[ticker]['Close']
-                else:
-                    st.warning(f"Price data structure error for {ticker}")
-                    continue
-
-            # Ensure price_hist is not empty before processing
-            if price_hist.empty:
-                st.warning(f"No price data found for {ticker}")
+                    # Check if 'Close' column exists for the specific ticker
+                    if 'Close' in price_data[ticker].columns:
+                        price_hist = price_data[ticker]['Close']
+            
+            # CRITICAL CHECK: Ensure price_hist is a valid Series and has sufficient data (252 days for 12M lookback)
+            if price_hist is None or price_hist.empty or price_hist.dropna().shape[0] < 252:
+                st.warning(f"Skipping {ticker}: Price data missing or incomplete for 12 months.")
                 continue
             
             # Basic data structure
@@ -65,24 +68,25 @@ def fetch_data(tickers):
                 'ROE': info.get('returnOnEquity', np.nan),
                 'DebtToEquity': info.get('debtToEquity', np.nan),
                 'Beta': info.get('beta', np.nan),
-                'CurrentPrice': price_hist.iloc[-1] if not price_hist.empty else np.nan,
+                'CurrentPrice': price_hist.iloc[-1],
                 'PriceHistory': price_hist,
             }
         except Exception as e:
-            st.error(f"Error fetching data for {ticker}: {e}")
+            # Catching errors related to yfinance data processing
+            st.error(f"Error processing data for {ticker}: {e}")
             continue
             
     return data
 
-# --- EXPERT ANALYSIS CORE FUNCTIONS ---
+# --- EXPERT ANALYSIS CORE FUNCTIONS (NO CHANGE FROM PREVIOUS COMPLETE VERSION) ---
 
 def compute_metrics(data):
     """
     Computes all individual metrics for the Expert Analysis.
+    (Days in: 3M ~ 63, 6M ~ 126, 12M ~ 252 trading days)
     """
     metrics_data = {}
     
-    # Days in: 3M ~ 63, 6M ~ 126, 12M ~ 252 trading days
     DAYS_3M = 63
     DAYS_6M = 126
     DAYS_12M = 252
@@ -95,9 +99,9 @@ def compute_metrics(data):
         
         # 1. Fundamental Metrics
         funda_metrics = {
-            'Value_PE': d.get('PE_Ratio', np.nan),         # Lower is better (L)
-            'Value_PS': d.get('PS_Ratio', np.nan),         # Lower is better (L)
-            'Profitability_ROE': d.get('ROE', np.nan),     # Higher is better (H)
+            'Value_PE': d.get('PE_Ratio', np.nan),         
+            'Value_PS': d.get('PS_Ratio', np.nan),         
+            'Profitability_ROE': d.get('ROE', np.nan),     
         }
 
         # 2. Momentum Metrics 
@@ -105,30 +109,28 @@ def compute_metrics(data):
         ret_12m = (price_hist.iloc[-1] / price_hist.iloc[-DAYS_12M] - 1) * 100 if len(price_hist) >= DAYS_12M else np.nan
 
         momentum_metrics = {
-            'Momentum_3M': ret_3m,                        # Higher is better (H)
-            'Momentum_12M': ret_12m,                      # Higher is better (H)
+            'Momentum_3M': ret_3m,                        
+            'Momentum_12M': ret_12m,                      
         }
 
         # 3. Quality/Stability Metrics
         quality_metrics = {
-            'Stability_D_E': d.get('DebtToEquity', np.nan), # Lower is better (L)
-            'Stability_Beta': d.get('Beta', np.nan),        # Lower is better (L)
+            'Stability_D_E': d.get('DebtToEquity', np.nan), 
+            'Stability_Beta': d.get('Beta', np.nan),        
         }
 
         # 4. Technical Metrics
         try:
-            # Simple technical score: Current price relative to 200-day MA
             MA200 = price_hist.rolling(window=200).mean().iloc[-1]
             Tech_MA200_Diff = ((d['CurrentPrice'] / MA200) - 1) * 100
         except:
             Tech_MA200_Diff = np.nan
             
         technical_metrics = {
-            'Tech_MA200_Proximity': Tech_MA200_Diff, # Higher is better (H)
+            'Tech_MA200_Proximity': Tech_MA200_Diff, 
         }
 
-        # --- Retrospective Validation Metrics (Historical Returns) ---
-        # Compares TODAY's score against PAST performance (retrospective)
+        # --- Retrospective Validation Metrics ---
         ret_past_3m = (price_hist.iloc[-1] / price_hist.iloc[-DAYS_3M] - 1) * 100 if len(price_hist) >= DAYS_3M else np.nan
         ret_past_6m = (price_hist.iloc[-1] / price_hist.iloc[-DAYS_6M] - 1) * 100 if len(price_hist) >= DAYS_6M else np.nan
         ret_past_12m = (price_hist.iloc[-1] / price_hist.iloc[-DAYS_12M] - 1) * 100 if len(price_hist) >= DAYS_12M else np.nan
@@ -152,15 +154,10 @@ def normalize_and_score(metrics_df):
 
     analysis_df = metrics_df.copy()
     
-    # Define how each raw metric should be scored (Higher is Better 'H', Lower is Better 'L')
     scoring_logic = {
-        'Value_PE': 'L',
-        'Value_PS': 'L',
-        'Profitability_ROE': 'H',
-        'Momentum_3M': 'H',
-        'Momentum_12M': 'H',
-        'Stability_D_E': 'L',
-        'Stability_Beta': 'L',
+        'Value_PE': 'L', 'Value_PS': 'L', 'Profitability_ROE': 'H',
+        'Momentum_3M': 'H', 'Momentum_12M': 'H',
+        'Stability_D_E': 'L', 'Stability_Beta': 'L',
         'Tech_MA200_Proximity': 'H',
     }
     
@@ -169,50 +166,33 @@ def normalize_and_score(metrics_df):
         if col in analysis_df.columns:
             temp_series = analysis_df[col].dropna()
             
-            # To handle extreme outliers, you could winsorize/cap values here before percentiling.
-            # For simplicity, we use the raw values for percentile rank calculation.
-            
             if not temp_series.empty and len(temp_series) > 1:
-                # Compute percentile ranks for non-NaN values
                 scores = [
                     percentileofscore(temp_series, x, 'weak') 
                     for x in analysis_df[col]
                 ]
                 
-                # Invert score for 'Lower is Better'
                 if logic == 'L':
                     scores = [100 - s for s in scores]
                 
-                # Re-apply NaNs where the original data was NaN
                 analysis_df[f'{col}_Score'] = scores
                 analysis_df.loc[analysis_df[col].isna(), f'{col}_Score'] = np.nan
             else:
-                # Assign NaN or a neutral score if not enough data for cross-section
                 analysis_df[f'{col}_Score'] = np.nan 
 
-
     # 2. Category Aggregation
-    
-    # Define the weights for the final score and components
     weights = {
-        'Fundamental': 0.35, 
-        'Technical': 0.15, 
-        'Momentum': 0.30, 
-        'Quality/Stability': 0.20
+        'Fundamental': 0.35, 'Technical': 0.15, 'Momentum': 0.30, 'Quality/Stability': 0.20
     }
     
-    # a. Fundamental Score (Mean of Value_PE_Score, Value_PS_Score, Profitability_ROE_Score)
     funda_cols = [c for c in analysis_df.columns if c.startswith('Value_') or c.startswith('Profitability_')]
     analysis_df['Fundamental_Score'] = analysis_df[[c for c in funda_cols if c.endswith('_Score')]].mean(axis=1)
     
-    # b. Technical Score
     analysis_df['Technical_Score'] = analysis_df['Tech_MA200_Proximity_Score']
 
-    # c. Momentum Score (Mean of Momentum_3M_Score, Momentum_12M_Score)
     momentum_cols = [c for c in analysis_df.columns if c.startswith('Momentum_')]
     analysis_df['Momentum_Score'] = analysis_df[[c for c in momentum_cols if c.endswith('_Score')]].mean(axis=1)
     
-    # d. Quality/Stability Score (Mean of Stability_D_E_Score, Stability_Beta_Score)
     quality_cols = [c for c in analysis_df.columns if c.startswith('Stability_')]
     analysis_df['Quality/Stability_Score'] = analysis_df[[c for c in quality_cols if c.endswith('_Score')]].mean(axis=1)
 
@@ -227,18 +207,12 @@ def normalize_and_score(metrics_df):
     final_score = 0
     total_weight = 0
     for col, weight in score_cols.items():
-        # Multiply score by weight
         score_component = analysis_df[col] * weight
-        # Ensure we only add the component if the score is not NaN
         final_score += score_component.fillna(0)
-        
-        # Calculate the *effective* total weight (excluding NaNs)
         total_weight += np.where(analysis_df[col].isna(), 0, weight)
         
-    # Normalize by the effective total weight sum to get a score out of 100
     analysis_df['Final_Weighted_Score'] = np.where(total_weight > 0, final_score / total_weight, np.nan)
     
-    # Keep only the relevant scores, returns, and raw metrics
     score_return_cols = [c for c in analysis_df.columns if 'Score' in c or c.startswith('Hist_Return')]
     return analysis_df[score_return_cols + list(metrics_df.columns)].drop_duplicates()
 
@@ -251,19 +225,16 @@ def run_expert_analysis(tickers):
     if not tickers:
         return pd.DataFrame()
         
-    # 1. Fetch Raw Data
     raw_data = fetch_data(tickers)
     st.session_state['raw_data'] = raw_data
     
-    # 2. Compute Individual Metrics
     metrics_df = compute_metrics(raw_data)
     
-    # 3. Normalize and Score
     analysis_df = normalize_and_score(metrics_df)
     
     return analysis_df.sort_values(by='Final_Weighted_Score', ascending=False)
 
-# --- PLOTLY VISUALIZATIONS ---
+# --- PLOTLY VISUALIZATIONS (NO CHANGE FROM PREVIOUS COMPLETE VERSION) ---
 
 def plot_radar_chart(df, ticker):
     """Radar chart of category scores for the selected stock."""
@@ -272,7 +243,6 @@ def plot_radar_chart(df, ticker):
 
     scores = df.loc[ticker, ['Fundamental_Score', 'Technical_Score', 'Momentum_Score', 'Quality/Stability_Score']].fillna(0)
     
-    # Ensure scores is a series of 4 values (for the 4 axes)
     if len(scores) < 4:
         return go.Figure().add_annotation(text="Incomplete data for radar chart.", showarrow=False)
 
@@ -309,12 +279,16 @@ def plot_final_score_bar_chart(df):
     """Bar chart of final scores across the filtered universe."""
     df_plot = df.reset_index().rename(columns={'index': 'Ticker'}).dropna(subset=['Final_Weighted_Score'])
     
-    fig = px.bar(df_plot, x='Ticker', y='Final_Weighted_Score',
+    # Remove the .NS suffix for display purposes
+    df_plot['Ticker_Display'] = df_plot['Ticker'].str.replace('.NS', '')
+
+    fig = px.bar(df_plot, x='Ticker_Display', y='Final_Weighted_Score',
                  title="Final Expert Score Across Universe",
                  color='Final_Weighted_Score',
                  color_continuous_scale=px.colors.sequential.Viridis,
                  height=400)
     fig.update_yaxes(range=[0, 100], title="Final Score (0-100)")
+    fig.update_xaxes(title="Ticker")
     fig.update_layout(margin=dict(l=30, r=30, t=50, b=30))
     return fig
 
@@ -336,7 +310,7 @@ def plot_score_vs_returns_scatter(df, return_type='Hist_Return_6M'):
                      hover_data=['Ticker'],
                      title=f"Score vs. {title_map.get(return_type, return_type)} (Retrospective Validation)",
                      labels={'Final_Weighted_Score': 'Final Score (0-100)', return_type: title_map.get(return_type, return_type)},
-                     color_discrete_sequence=['#FF4B4B'], # Streamlit red color
+                     color_discrete_sequence=['#FF4B4B'], 
                      height=450)
     
     fig.update_xaxes(range=[0, 100])
@@ -350,13 +324,11 @@ def plot_returns_by_quartile_bar(df, return_type='Hist_Return_6M'):
     if df_temp.empty or len(df_temp) < 4:
         return go.Figure().add_annotation(text="Not enough data to compute meaningful quartiles (need at least 4 stocks).", showarrow=False)
 
-    # Determine Quartiles
     try:
         df_temp['Score_Quartile'] = pd.qcut(df_temp['Final_Weighted_Score'], q=4, labels=['Q1 (Low)', 'Q2', 'Q3', 'Q4 (High)'], duplicates='drop')
     except ValueError:
         return go.Figure().add_annotation(text="Not enough unique score values to create 4 quartiles.", showarrow=False)
         
-    # Calculate Mean Return per Quartile
     quartile_performance = df_temp.groupby('Score_Quartile')[return_type].mean().reset_index()
     
     title_map = {
@@ -375,95 +347,97 @@ def plot_returns_by_quartile_bar(df, return_type='Hist_Return_6M'):
     fig.update_layout(margin=dict(l=30, r=30, t=50, b=30))
     return fig
 
-# --- UI COMPONENTS (Mimicking Existing Flow) ---
+# --- UI COMPONENTS ---
 
 def sidebar_menu():
     """Sets up the sidebar with navigation buttons."""
     st.sidebar.header("Navigation")
     
-    # Home/Screener Page
     if st.sidebar.button("🏠 Screener Input", key='nav_home'):
         st.session_state['page'] = 'Home'
         
-    # Results/Expert Analysis Page
     if st.sidebar.button("📊 Results & Expert Analysis", key='nav_results'):
-        if st.session_state['tickers']:
+        if not st.session_state['analysis_df'].empty:
             st.session_state['page'] = 'Results'
         else:
-            st.sidebar.warning("Please enter tickers first.")
+            st.sidebar.warning("Please run the screener first.")
 
-    # Technical Analysis Page (Can also contain detailed analysis)
     if st.sidebar.button("📈 Technical Details", key='nav_tech'):
-        if st.session_state['tickers']:
+        if not st.session_state['analysis_df'].empty:
             st.session_state['page'] = 'Technical'
         else:
-            st.sidebar.warning("Please enter tickers first.")
+            st.sidebar.warning("Please run the screener first.")
 
-    # Selection for detailed view (used on Results/Technical pages)
     if st.session_state['analysis_df'] is not None and not st.session_state['analysis_df'].empty:
         st.sidebar.markdown("---")
         
-        # Sort tickers by Final Score for intuitive selection
         sorted_tickers = st.session_state['analysis_df'].index.tolist()
         
-        # Determine the initial selection
-        if st.session_state['selected_stock'] not in sorted_tickers:
-             initial_selection = sorted_tickers[0] if sorted_tickers else None
+        # Remove the .NS suffix for display in the sidebar
+        display_options = [t.replace('.NS', '') for t in sorted_tickers]
+        
+        # Get the currently selected stock's display name
+        current_display = st.session_state['selected_stock'].replace('.NS', '') if st.session_state['selected_stock'] and '.NS' in st.session_state['selected_stock'] else (display_options[0] if display_options else None)
+        
+        if current_display in display_options:
+            index_val = display_options.index(current_display)
         else:
-             initial_selection = st.session_state['selected_stock']
+            index_val = 0
              
-        st.session_state['selected_stock'] = st.sidebar.selectbox(
+        selected_display = st.sidebar.selectbox(
             "Select Stock for Detail View:", 
-            options=sorted_tickers,
-            index=sorted_tickers.index(initial_selection) if initial_selection in sorted_tickers else 0
+            options=display_options,
+            index=index_val
         )
-    elif st.session_state['tickers']:
-         st.sidebar.markdown("---")
-         st.session_state['selected_stock'] = st.sidebar.selectbox(
-            "Select Stock for Detail View:", 
-            st.session_state['tickers']
-        )
+        # Store the full ticker with .NS suffix back into session state
+        st.session_state['selected_stock'] = selected_display + '.NS'
 
 
 def home_page():
     """The main input page."""
-    st.title("Screener Input: Ticker Universe")
-    st.info("Enter tickers separated by commas (e.g., AAPL, GOOGL, MSFT, AMZN, TSLA)")
+    st.title("🇮🇳 India Stocks Screener Input (NSE Only)")
+    st.info("Enter NSE tickers separated by commas (e.g., RELIANCE, TCS, HDFCBANK). The **.NS** suffix is added automatically.")
 
-    # User Input for Tickers
+    # User Input for Tickers (displaying clean names if available)
+    clean_tickers = [t.replace('.NS', '') for t in st.session_state['tickers']]
     ticker_input = st.text_input(
         "Enter Tickers:", 
-        value=", ".join(st.session_state['tickers']),
+        value=", ".join(clean_tickers),
         key='ticker_input'
     )
     
     col1, col2 = st.columns([1, 4])
     with col1:
         if st.button("Run Screener & Analysis"):
+            
+            # --- CRITICAL CHANGE FOR INDIA STOCKS ---
             raw_tickers = [t.strip().upper() for t in ticker_input.split(',') if t.strip()]
             
             if not raw_tickers:
                 st.error("Please enter valid tickers.")
                 return
 
-            # Update session state with new tickers
-            st.session_state['tickers'] = raw_tickers
-            st.session_state['analysis_df'] = pd.DataFrame() # Clear previous run
+            # Append the .NS suffix if it's missing (enforcing NSE only)
+            normalized_tickers = [t if t.endswith('.NS') else f"{t}.NS" for t in raw_tickers]
+            
+            st.session_state['tickers'] = normalized_tickers
+            st.session_state['analysis_df'] = pd.DataFrame() 
+            st.session_state['raw_data'] = None
             
             # Run the new analysis pipeline
-            analysis_df = run_expert_analysis(raw_tickers)
+            analysis_df = run_expert_analysis(normalized_tickers)
             st.session_state['analysis_df'] = analysis_df
             
-            # Automatically navigate to Results page upon completion
             if not analysis_df.empty:
+                # Set initial selected stock for detail view
+                st.session_state['selected_stock'] = analysis_df.index[0]
                 st.session_state['page'] = 'Results'
                 st.success("Analysis Complete!")
                 st.experimental_rerun()
             else:
-                 st.error("Analysis failed or returned no valid data.")
+                 st.error("Analysis failed. Check if all entered tickers are correct NSE symbols.")
             
     with col2:
-        # Keep placeholder or original content intact
         st.empty()
 
 def results_page():
@@ -481,10 +455,15 @@ def results_page():
     display_cols = [
         'Final_Weighted_Score', 'Fundamental_Score', 'Technical_Score', 
         'Momentum_Score', 'Quality/Stability_Score', 
-        'Hist_Return_6M' # Include a key validation metric here
+        'Hist_Return_6M'
     ]
+    
+    # Create a display copy with clean ticker names
+    df_display = df.copy()
+    df_display.index = df_display.index.str.replace('.NS', '')
+
     st.dataframe(
-        df[display_cols].style.format({
+        df_display[display_cols].style.format({
             'Final_Weighted_Score': "{:.1f}", 
             'Fundamental_Score': "{:.1f}", 
             'Technical_Score': "{:.1f}", 
@@ -500,12 +479,9 @@ def results_page():
     # --- Section 2: Final Score Distribution and Validation Plots ---
     st.header("2. Universe-Wide Insights (Backtest-Style Validation)")
     
-    col_score_bar, col_spacer = st.columns([1, 0.01])
-    with col_score_bar:
-        st.subheader("Final Score Distribution")
-        st.plotly_chart(plot_final_score_bar_chart(df), use_container_width=True)
+    st.subheader("Final Score Distribution")
+    st.plotly_chart(plot_final_score_bar_chart(df), use_container_width=True)
 
-    # 2.2 Score vs. Historical Returns (Validation)
     st.subheader("Retrospective Validation: Score vs. Historical Returns")
     
     return_option = st.selectbox(
@@ -531,7 +507,9 @@ def results_page():
     selected_stock = st.session_state['selected_stock']
     
     if selected_stock and selected_stock in df.index:
-        st.subheader(f"Category Breakdown for {selected_stock}")
+        # Display the clean ticker name
+        display_name = selected_stock.replace('.NS', '')
+        st.subheader(f"Category Breakdown for {display_name}")
         
         col_radar, col_detail = st.columns([1, 2])
         
@@ -542,7 +520,6 @@ def results_page():
             st.subheader("Raw Metrics and Normalized Scores")
             stock_data = df.loc[[selected_stock]].T.rename(columns={selected_stock: 'Value'})
             
-            # Filter the display to key metrics + scores
             key_metrics_and_scores = [
                 'Final_Weighted_Score', 'Fundamental_Score', 'Momentum_Score', 'Technical_Score', 'Quality/Stability_Score',
                 'Value_PE', 'Value_PE_Score', 'Profitability_ROE', 'Profitability_ROE_Score',
@@ -550,12 +527,10 @@ def results_page():
                 'Stability_Beta', 'Stability_Beta_Score', 'Hist_Return_6M'
             ]
             
-            # Prioritize the display order
             display_order = [idx for idx in key_metrics_and_scores if idx in stock_data.index]
             stock_data = stock_data.reindex(display_order)
             stock_data = stock_data[stock_data['Value'].notna()]
             
-            # Format display
             def format_metric(index, value):
                 if '_Score' in index or index.startswith('Final_'):
                     return f"{value:.1f}"
@@ -587,15 +562,14 @@ def technical_page():
         st.error("No data available or stock not selected. Please run the screener first.")
         return
 
-    st.subheader(f"Detailed Technical and Momentum Metrics for **{selected_stock}**")
+    display_name = selected_stock.replace('.NS', '')
+    st.subheader(f"Detailed Technical and Momentum Metrics for **{display_name}**")
 
-    # Display key metrics related to Technical/Momentum
     metrics_to_show = [
         'Technical_Score', 'Tech_MA200_Proximity', 'Tech_MA200_Proximity_Score',
         'Momentum_Score', 'Momentum_3M', 'Momentum_3M_Score', 'Momentum_12M', 'Momentum_12M_Score'
     ]
     
-    # Filter to only show relevant rows and format
     stock_df = df.loc[[selected_stock]].T
     tech_data = stock_df.loc[stock_df.index.intersection(metrics_to_show)]
     
@@ -614,23 +588,22 @@ def technical_page():
 
     st.dataframe(styled_tech_df, use_container_width=True)
 
-    # Simple Price Plot (as a placeholder for a complex technical chart)
+    # Simple Price Plot
     st.subheader("Price History (Last 1 Year)")
     
     try:
         if selected_stock in raw_data and 'PriceHistory' in raw_data[selected_stock]:
             price_hist = raw_data[selected_stock]['PriceHistory']
             
-            # Calculate 200-day MA for technical context
             price_hist = pd.DataFrame(price_hist).rename(columns={'Close': 'Price'})
             price_hist['MA200'] = price_hist['Price'].rolling(window=200).mean()
             
             fig = px.line(price_hist, 
                           y=['Price', 'MA200'], 
-                          title=f"{selected_stock} Price History vs 200-Day MA",
+                          title=f"{display_name} Price History vs 200-Day MA",
                           color_discrete_map={'Price': '#007BFF', 'MA200': '#FF4B4B'})
             
-            fig.update_layout(yaxis_title="Price ($)")
+            fig.update_layout(yaxis_title="Price (₹)")
             st.plotly_chart(fig, use_container_width=True)
         else:
             st.warning("Price history data not available in session state.")
@@ -643,10 +616,8 @@ def technical_page():
 def main():
     """The main function to run the application and handle navigation."""
     
-    # 1. Sidebar (Always present)
     sidebar_menu()
 
-    # 2. Main Content (Page Switcher)
     if st.session_state['page'] == 'Home':
         home_page()
     elif st.session_state['page'] == 'Results':
@@ -655,7 +626,7 @@ def main():
         technical_page()
         
     st.markdown("---")
-    st.caption("Integrated Expert Screener: Multi-Factor Scoring Engine")
+    st.caption("Integrated Expert Screener: Multi-Factor Scoring Engine for Indian Stocks (NSE)")
 
 if __name__ == "__main__":
     main()
