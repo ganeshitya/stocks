@@ -2,7 +2,7 @@ streamlit
 yfinance
 pandas
 numpy
-pandas-datareader
+pandas-datareader>=0.10.0
 requests
 ta
 plotly
