@@ -78,12 +78,11 @@ def fetch_data(tickers):
             
     return data
 
-# --- EXPERT ANALYSIS CORE FUNCTIONS (NO CHANGE FROM PREVIOUS COMPLETE VERSION) ---
+# --- EXPERT ANALYSIS CORE FUNCTIONS ---
 
 def compute_metrics(data):
     """
     Computes all individual metrics for the Expert Analysis.
-    (Days in: 3M ~ 63, 6M ~ 126, 12M ~ 252 trading days)
     """
     metrics_data = {}
     
@@ -232,9 +231,13 @@ def run_expert_analysis(tickers):
     
     analysis_df = normalize_and_score(metrics_df)
     
+    # --- CRITICAL FIX: Check if the DataFrame is empty before sorting ---
+    if analysis_df.empty:
+        return analysis_df
+        
     return analysis_df.sort_values(by='Final_Weighted_Score', ascending=False)
 
-# --- PLOTLY VISUALIZATIONS (NO CHANGE FROM PREVIOUS COMPLETE VERSION) ---
+# --- PLOTLY VISUALIZATIONS ---
 
 def plot_radar_chart(df, ticker):
     """Radar chart of category scores for the selected stock."""
@@ -269,7 +272,7 @@ def plot_radar_chart(df, ticker):
             bgcolor='white'
         ),
         showlegend=False,
-        title=f"Expert Score Categories for **{ticker}**",
+        title=f"Expert Score Categories for **{ticker.replace('.NS', '')}**",
         height=400,
         margin=dict(l=30, r=30, t=50, b=30)
     )
@@ -279,6 +282,9 @@ def plot_final_score_bar_chart(df):
     """Bar chart of final scores across the filtered universe."""
     df_plot = df.reset_index().rename(columns={'index': 'Ticker'}).dropna(subset=['Final_Weighted_Score'])
     
+    if df_plot.empty:
+        return go.Figure().add_annotation(text="No complete data available for scoring.", showarrow=False)
+
     # Remove the .NS suffix for display purposes
     df_plot['Ticker_Display'] = df_plot['Ticker'].str.replace('.NS', '')
 
@@ -376,8 +382,9 @@ def sidebar_menu():
         # Remove the .NS suffix for display in the sidebar
         display_options = [t.replace('.NS', '') for t in sorted_tickers]
         
-        # Get the currently selected stock's display name
-        current_display = st.session_state['selected_stock'].replace('.NS', '') if st.session_state['selected_stock'] and '.NS' in st.session_state['selected_stock'] else (display_options[0] if display_options else None)
+        # Determine the currently selected stock (using the full ticker name)
+        current_full_ticker = st.session_state.get('selected_stock', sorted_tickers[0])
+        current_display = current_full_ticker.replace('.NS', '')
         
         if current_display in display_options:
             index_val = display_options.index(current_display)
@@ -398,7 +405,6 @@ def home_page():
     st.title("🇮🇳 India Stocks Screener Input (NSE Only)")
     st.info("Enter NSE tickers separated by commas (e.g., RELIANCE, TCS, HDFCBANK). The **.NS** suffix is added automatically.")
 
-    # User Input for Tickers (displaying clean names if available)
     clean_tickers = [t.replace('.NS', '') for t in st.session_state['tickers']]
     ticker_input = st.text_input(
         "Enter Tickers:", 
@@ -410,7 +416,6 @@ def home_page():
     with col1:
         if st.button("Run Screener & Analysis"):
             
-            # --- CRITICAL CHANGE FOR INDIA STOCKS ---
             raw_tickers = [t.strip().upper() for t in ticker_input.split(',') if t.strip()]
             
             if not raw_tickers:
@@ -432,10 +437,10 @@ def home_page():
                 # Set initial selected stock for detail view
                 st.session_state['selected_stock'] = analysis_df.index[0]
                 st.session_state['page'] = 'Results'
-                st.success("Analysis Complete!")
+                st.success("Analysis Complete! Displaying results.")
                 st.experimental_rerun()
             else:
-                 st.error("Analysis failed. Check if all entered tickers are correct NSE symbols.")
+                 st.error("Analysis failed. No stocks passed the data validation checks. Please check if tickers are correct NSE symbols and have 12 months of price history.")
             
     with col2:
         st.empty()
@@ -446,7 +451,7 @@ def results_page():
 
     df = st.session_state['analysis_df']
     if df.empty:
-        st.error("No valid data available. Please run the screener first.")
+        st.error("No valid data available. Please run the screener first or check the input tickers.")
         st.session_state['page'] = 'Home'
         return
 
@@ -507,7 +512,6 @@ def results_page():
     selected_stock = st.session_state['selected_stock']
     
     if selected_stock and selected_stock in df.index:
-        # Display the clean ticker name
         display_name = selected_stock.replace('.NS', '')
         st.subheader(f"Category Breakdown for {display_name}")
         
