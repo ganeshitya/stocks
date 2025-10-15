@@ -11,7 +11,7 @@ import io
 
 # --- Configuration ---
 st.set_page_config(
-    page_title="Advanced Hybrid Stock Screener V3.2",
+    page_title="Advanced Hybrid Stock Screener V3.3",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -20,10 +20,7 @@ st.set_page_config(
 PICK_FILE = "strong_buy_picks.json"
 
 # --- Function to parse Nifty 500 symbols from CSV ---
-# NOTE: This function uses the previously fetched ind_nifty500list.csv content.
 def parse_nifty_symbols():
-    # The content of the uploaded ind_nifty500list.csv file.
-    # In a live environment, this string would contain all 500+ stocks.
     nifty_csv_content = """Company Name,Industry,Symbol,Series,ISIN Code
 360 ONE WAM Ltd.,Financial Services,360ONE,EQ,INE466L01038
 3M India Ltd.,Diversified,3MINDIA,EQ,INE470A01017
@@ -64,9 +61,7 @@ Wipro Ltd.,Information Technology,WIPRO,EQ,INE075A01022
 """ 
     try:
         df = pd.read_csv(io.StringIO(nifty_csv_content))
-        # Add .NS for yfinance compatibility if not present (assuming all are NSE symbols)
         df['YF_Symbol'] = df['Symbol'].apply(lambda x: f"{x}.NS")
-        # Create a mapping for display (e.g., "RELIANCE (Reliance Industries Ltd.)")
         df['Display_Name'] = df['Symbol'] + " (" + df['Company Name'] + ")"
         
         symbol_map = pd.Series(df.YF_Symbol.values, index=df.Display_Name).to_dict()
@@ -76,19 +71,19 @@ Wipro Ltd.,Information Technology,WIPRO,EQ,INE075A01022
     except Exception:
         return [], {}
 
-# --- 1. Data Fetching (yfinance Only) ---
+# --- 1. Enhanced Data Fetching with Analyst Recommendations ---
 
-@st.cache_data(show_spinner="Fetching and validating stock data (This may take a minute)...")
+@st.cache_data(show_spinner="Fetching stock data, analyst ratings, and news...")
 def fetch_data(tickers):
     """
-    Fetches price history (for technicals) and fundamental data (for fundamentals)
-    using yfinance exclusively. Includes external recommendation consensus.
+    Fetches price history, fundamental data, analyst recommendations,
+    and news using yfinance.
     """
     if not tickers:
         return {}
 
     end_date = datetime.now()
-    start_date = end_date - timedelta(days=18 * 30) # 1.5 years for 200-day SMA and 1Y change
+    start_date = end_date - timedelta(days=18 * 30)
     
     data = {}
     
@@ -110,6 +105,29 @@ def fetch_data(tickers):
             if sector == 'N/A':
                  continue
             
+            # --- NEW: Fetch Analyst Recommendations ---
+            try:
+                recommendations = stock.recommendations
+                analyst_ratings = extract_analyst_ratings(recommendations)
+            except:
+                analyst_ratings = {
+                    'total_analysts': 0,
+                    'strong_buy': 0,
+                    'buy': 0,
+                    'hold': 0,
+                    'sell': 0,
+                    'strong_sell': 0,
+                    'weighted_score': 0,
+                    'consensus': 'N/A'
+                }
+            
+            # --- NEW: Fetch Recent News ---
+            try:
+                news = stock.news[:5] if hasattr(stock, 'news') and stock.news else []
+                news_items = extract_news_items(news)
+            except:
+                news_items = []
+            
             data[full_ticker] = {
                 # Fundamental Metrics
                 'PE_Ratio': info.get('trailingPE', np.nan),
@@ -120,22 +138,131 @@ def fetch_data(tickers):
                 # Technical/Risk Metrics
                 'Beta': info.get('beta', np.nan),
                 
-                # --- NEW: External Recommendation Consensus ---
-                # This field often reflects the consensus of analysts tracked by the data provider.
+                # External Recommendation Consensus
                 'External_Recommendation': info.get('recommendationKey', 'N/A').upper().replace('STRONG_BUY', 'STRONG BUY'),
+                
+                # --- NEW: Analyst Ratings Data ---
+                'Analyst_Ratings': analyst_ratings,
+                
+                # Target Price
+                'Target_Mean': info.get('targetMeanPrice', np.nan),
+                'Target_High': info.get('targetHighPrice', np.nan),
+                'Target_Low': info.get('targetLowPrice', np.nan),
+                
+                # --- NEW: News Items ---
+                'News': news_items,
                 
                 # Metadata
                 'CurrentPrice': current_price,
                 'Sector': sector,
                 'PriceHistory': price_hist,
+                'Company_Name': info.get('longName', full_ticker),
             }
 
-        except Exception:
+        except Exception as e:
             continue
             
     return data
 
-# ----------------------------------------------------------------------
+def extract_analyst_ratings(recommendations_df):
+    """
+    Extracts and calculates weighted analyst ratings from recommendations DataFrame.
+    Returns a dictionary with rating counts and consensus.
+    """
+    if recommendations_df is None or recommendations_df.empty:
+        return {
+            'total_analysts': 0,
+            'strong_buy': 0,
+            'buy': 0,
+            'hold': 0,
+            'sell': 0,
+            'strong_sell': 0,
+            'weighted_score': 0,
+            'consensus': 'N/A'
+        }
+    
+    # Get the most recent recommendations (last 3 months)
+    recent_date = datetime.now() - timedelta(days=90)
+    recent_recs = recommendations_df[recommendations_df.index >= recent_date]
+    
+    if recent_recs.empty:
+        recent_recs = recommendations_df.tail(10)  # Use last 10 if no recent data
+    
+    # Count ratings
+    ratings = {
+        'strong_buy': 0,
+        'buy': 0,
+        'hold': 0,
+        'sell': 0,
+        'strong_sell': 0
+    }
+    
+    for col in recent_recs.columns:
+        col_lower = col.lower()
+        if 'strongbuy' in col_lower or 'strong buy' in col_lower:
+            ratings['strong_buy'] = recent_recs[col].sum()
+        elif 'buy' in col_lower and 'strong' not in col_lower:
+            ratings['buy'] = recent_recs[col].sum()
+        elif 'hold' in col_lower:
+            ratings['hold'] = recent_recs[col].sum()
+        elif 'sell' in col_lower and 'strong' not in col_lower:
+            ratings['sell'] = recent_recs[col].sum()
+        elif 'strongsell' in col_lower or 'strong sell' in col_lower:
+            ratings['strong_sell'] = recent_recs[col].sum()
+    
+    total = sum(ratings.values())
+    
+    # Calculate weighted score (5 = Strong Buy, 1 = Strong Sell)
+    if total > 0:
+        weighted_score = (
+            ratings['strong_buy'] * 5 +
+            ratings['buy'] * 4 +
+            ratings['hold'] * 3 +
+            ratings['sell'] * 2 +
+            ratings['strong_sell'] * 1
+        ) / total
+    else:
+        weighted_score = 0
+    
+    # Determine consensus
+    if weighted_score >= 4.5:
+        consensus = 'STRONG BUY'
+    elif weighted_score >= 3.5:
+        consensus = 'BUY'
+    elif weighted_score >= 2.5:
+        consensus = 'HOLD'
+    elif weighted_score >= 1.5:
+        consensus = 'SELL'
+    else:
+        consensus = 'STRONG SELL'
+    
+    return {
+        'total_analysts': int(total),
+        'strong_buy': int(ratings['strong_buy']),
+        'buy': int(ratings['buy']),
+        'hold': int(ratings['hold']),
+        'sell': int(ratings['sell']),
+        'strong_sell': int(ratings['strong_sell']),
+        'weighted_score': round(weighted_score, 2),
+        'consensus': consensus
+    }
+
+def extract_news_items(news_list):
+    """
+    Extracts relevant information from news items.
+    """
+    news_items = []
+    for item in news_list[:5]:  # Limit to 5 most recent
+        try:
+            news_items.append({
+                'title': item.get('title', 'N/A'),
+                'publisher': item.get('publisher', 'Unknown'),
+                'link': item.get('link', '#'),
+                'published': datetime.fromtimestamp(item.get('providerPublishTime', 0)).strftime('%Y-%m-%d %H:%M') if item.get('providerPublishTime') else 'N/A'
+            })
+        except:
+            continue
+    return news_items
 
 # --- 2. Metric Calculation (Technicals and Risk) ---
 
@@ -151,7 +278,7 @@ def calculate_technical_metrics(price_hist):
     rs = gain / loss
     rsi = 100 - (100 / (1 + rs)).iloc[-1]
     
-    # 2. MACD (12, 26, 9) - Crossover Distance
+    # 2. MACD (12, 26, 9)
     exp12 = price_hist.ewm(span=12, adjust=False).mean()
     exp26 = price_hist.ewm(span=26, adjust=False).mean()
     macd = exp12 - exp26
@@ -163,7 +290,7 @@ def calculate_technical_metrics(price_hist):
     sma200 = price_hist.rolling(window=200).mean().iloc[-1]
     sma_signal = sma50 / sma200 
     
-    # 4. Volatility (Annualized log returns)
+    # 4. Volatility
     log_returns = np.log(price_hist / price_hist.shift(1)).dropna()
     volatility = log_returns.std() * np.sqrt(252)
     
@@ -190,13 +317,17 @@ def compute_all_metrics(data):
         end_price = price_hist.iloc[-1]
         d['1Y_Change'] = ((end_price - start_price) / start_price) if start_price != 0 else np.nan
         
+        # Calculate upside potential
+        if not pd.isna(d['Target_Mean']) and d['CurrentPrice'] > 0:
+            d['Upside_Potential'] = ((d['Target_Mean'] - d['CurrentPrice']) / d['CurrentPrice']) * 100
+        else:
+            d['Upside_Potential'] = np.nan
+        
         processed_data[ticker] = d
         
     return pd.DataFrame.from_dict(processed_data, orient='index')
 
-# ----------------------------------------------------------------------
-
-# --- 3. Z-Score Normalization (Vs Sector Peers) ---
+# --- 3. Z-Score Normalization ---
 
 def z_score_normalize_by_sector(df, metric, direction):
     """Calculates Z-score for a metric relative to its sector group."""
@@ -222,12 +353,10 @@ def z_score_normalize_by_sector(df, metric, direction):
     df_merged[scored_metric_name] = df_merged.apply(calculate_z, axis=1)
     return df_merged[[scored_metric_name]]
 
-# ----------------------------------------------------------------------
-
-# --- 4. Scoring Logic (KPIS & Final Score) ---
+# --- 4. Scoring Logic ---
 
 def calculate_kpis_and_total_score(df):
-    """Calculates the 3 main KPI scores (0-4, 0-4, 0-2) and the final 0-10 score."""
+    """Calculates the 3 main KPI scores and the final score."""
     if df.empty:
         return df
     
@@ -255,27 +384,25 @@ def calculate_kpis_and_total_score(df):
             
         return df, score_col
 
-    # 4.1. --- FUNDAMENTAL STRENGTH (40% / 0-4 points) ---
+    # Fundamental Strength (40%)
     fund_metrics = {'PE_Ratio': 'lower', 'ROE': 'higher', 'DebtToEquity': 'lower', 'Growth': 'higher'}
     scored_df, fund_score_col = calculate_and_scale_score(scored_df, fund_metrics, 4)
     scored_df = scored_df.rename(columns={fund_score_col: 'Fundamental_Score'})
 
-    # 4.2. --- TECHNICAL MOMENTUM (40% / 0-4 points) ---
+    # Technical Momentum (40%)
     tech_metrics = {'RSI': 'higher', 'MACD_Signal': 'higher', 'SMA_Signal': 'higher', '1Y_Change': 'higher'}
     scored_df, tech_score_col = calculate_and_scale_score(scored_df, tech_metrics, 4)
     scored_df = scored_df.rename(columns={tech_score_col: 'Technical_Score'})
 
-
-    # 4.3. --- SECTOR & RISK FACTORS (20% / 0-2 points) ---
+    # Sector & Risk Factors (20%)
     risk_metrics = {'Beta': 'lower', 'Volatility': 'lower'}
     scored_df, risk_score_col = calculate_and_scale_score(scored_df, risk_metrics, 2)
     scored_df = scored_df.rename(columns={risk_score_col: 'Sector_Score'})
 
-
-    # 4.4. --- TOTAL SCORE (0-10) and RECOMMENDATION ---
+    # Total Score (0-10)
     scored_df['Total_Score'] = scored_df['Fundamental_Score'] + scored_df['Technical_Score'] + scored_df['Sector_Score']
     
-    # 4.5. --- Recommendation ---
+    # Recommendation
     def assign_recommendation(score):
         if score >= 9.0:
             return "STRONG BUY"
@@ -290,9 +417,7 @@ def calculate_kpis_and_total_score(df):
     
     return scored_df.sort_values('Total_Score', ascending=False)
 
-# ----------------------------------------------------------------------
-
-# --- 5. Backtesting Module (Stubbed for this request) ---
+# --- 5. Backtesting Module ---
 
 def load_picks():
     if os.path.exists(PICK_FILE):
@@ -374,8 +499,6 @@ def run_backtest_summary():
     
     return summary[['Count', 'Mean', 'Median']]
 
-# ----------------------------------------------------------------------
-
 # --- 6. Visualization & UI ---
 
 def create_radar_chart(df, ticker):
@@ -394,13 +517,39 @@ def create_radar_chart(df, ticker):
     fig.add_trace(go.Scatterpolar(r=stock_scaled, theta=categories, fill='toself', name=f'{ticker} Score'))
     fig.add_trace(go.Scatterpolar(r=sector_scaled, theta=categories, fill='toself', name=f'{sector} Average'))
 
-    fig.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0, 100])), showlegend=True, title=f'{ticker} Performance vs. {sector} Peers (Scaled to 100%)')
+    fig.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0, 100])), showlegend=True, title=f'{ticker} Performance vs. {sector} Peers')
     return fig
 
+def create_analyst_distribution_chart(analyst_ratings):
+    """Creates a bar chart showing analyst rating distribution."""
+    categories = ['Strong Buy', 'Buy', 'Hold', 'Sell', 'Strong Sell']
+    values = [
+        analyst_ratings['strong_buy'],
+        analyst_ratings['buy'],
+        analyst_ratings['hold'],
+        analyst_ratings['sell'],
+        analyst_ratings['strong_sell']
+    ]
+    
+    colors = ['#00CC00', '#66FF66', '#FFD700', '#FF9900', '#FF0000']
+    
+    fig = go.Figure(data=[
+        go.Bar(x=categories, y=values, marker_color=colors, text=values, textposition='auto')
+    ])
+    
+    fig.update_layout(
+        title=f"Analyst Ratings Distribution (Total: {analyst_ratings['total_analysts']} Analysts)",
+        xaxis_title="Rating",
+        yaxis_title="Number of Analysts",
+        showlegend=False,
+        height=350
+    )
+    
+    return fig
 
 def sidebar_inputs():
     """Defines the sidebar layout and retrieves user selected tickers."""
-    st.sidebar.title("📈 Hybrid Screener V3.2")
+    st.sidebar.title("📈 Hybrid Screener V3.3")
     st.sidebar.markdown("---")
     
     st.sidebar.header("⚖️ Model Weighting (Fixed)")
@@ -413,10 +562,17 @@ def sidebar_inputs():
     """)
     st.sidebar.markdown("---")
     
-    # Get symbols and map for user selection (reverting to user input)
+    st.sidebar.header("🆕 New Features")
+    st.sidebar.markdown("""
+        - ✅ Weighted Analyst Ratings
+        - ✅ Expert Recommendations
+        - ✅ Latest News & Insights
+        - ✅ Target Price Analysis
+    """)
+    st.sidebar.markdown("---")
+    
     display_names, symbol_map = parse_nifty_symbols()
     
-    # Define a default selection (using a mix of the symbols available in the snippet)
     default_names = [
         "RELIANCE (Reliance Industries Ltd.)", 
         "TCS (Tata Consultancy Services Ltd.)", 
@@ -427,27 +583,24 @@ def sidebar_inputs():
     ]
     
     initial_selection = [name for name in default_names if name in display_names]
-
     
     selected_names = st.sidebar.multiselect(
         "Select Stocks for Analysis (NSE)",
         options=display_names,
         default=initial_selection,
-        help="Choose 3-10 stocks from the list to analyze their scores relative to their sector peers."
+        help="Choose stocks from the list to analyze their scores, analyst ratings, and news."
     )
     
-    # Convert display names back to yfinance ticker symbols (e.g., "TCS.NS")
     selected_tickers = [symbol_map[name] for name in selected_names]
     
     return selected_tickers 
-
 
 def results_page(scored_df):
     """Displays the main results and visualizations."""
     
     capture_strong_buy_picks(scored_df)
     
-    st.title("🏆 Hybrid Stock Analysis Results (V3.2)")
+    st.title("🏆 Hybrid Stock Analysis Results (V3.3)")
     st.subheader("Fixed Model Weighting: 40% Fundamental / 40% Technical / 20% Risk")
     st.markdown(f"**Analysis Date:** {datetime.now().strftime('%Y-%m-%d')}")
 
@@ -455,89 +608,228 @@ def results_page(scored_df):
         st.error("No stocks were selected or passed the data validation checks.")
         return
 
-    # --- 1. Ranked Stock Summary (Table) ---
-    st.header("1. Scores and Recommendations")
+    # --- 1. Enhanced Ranked Stock Summary with Analyst Ratings ---
+    st.header("1. Scores, Recommendations & Analyst Ratings")
     
     display_cols = ['Total_Score', 'Balanced_Recommendation', 'External_Recommendation',
                     'Fundamental_Score', 'Technical_Score', 'Sector_Score',
-                    'CurrentPrice', 'Sector']
+                    'CurrentPrice', 'Target_Mean', 'Upside_Potential', 'Sector']
     
     formatted_df = scored_df[display_cols].copy()
-    formatted_df.columns = ['Total Score (0-10)', 'App Recommendation', 'External Consensus',
+    
+    # Add analyst consensus
+    formatted_df['Analyst_Consensus'] = scored_df['Analyst_Ratings'].apply(lambda x: x['consensus'] if isinstance(x, dict) else 'N/A')
+    formatted_df['Num_Analysts'] = scored_df['Analyst_Ratings'].apply(lambda x: x['total_analysts'] if isinstance(x, dict) else 0)
+    
+    formatted_df.columns = ['Total Score (0-10)', 'App Recommendation', 'YF Consensus',
                             'Fund. Score (0-4)', 'Tech. Score (0-4)', 'Risk Score (0-2)',
-                            'Price (INR)', 'Sector']
+                            'Current Price', 'Target Price', 'Upside %', 'Sector', 
+                            'Analyst Consensus', '# Analysts']
     
     # Apply formatting
     for col in ['Total Score (0-10)', 'Fund. Score (0-4)', 'Tech. Score (0-4)', 'Risk Score (0-2)']:
         formatted_df[col] = formatted_df[col].round(2)
         
-    formatted_df['Price (INR)'] = formatted_df['Price (INR)'].apply(lambda x: f"₹{x:,.2f}")
+    formatted_df['Current Price'] = formatted_df['Current Price'].apply(lambda x: f"₹{x:,.2f}")
+    formatted_df['Target Price'] = formatted_df['Target Price'].apply(lambda x: f"₹{x:,.2f}" if not pd.isna(x) else 'N/A')
+    formatted_df['Upside %'] = formatted_df['Upside %'].apply(lambda x: f"{x:.1f}%" if not pd.isna(x) else 'N/A')
 
-    # Show the core scoring and recommendation table
     st.dataframe(formatted_df, use_container_width=True)
     
     st.markdown("""
-        **Note on Recommendations:**
-        * **App Recommendation:** Derived from the 40/40/20 Fixed Model Score (>=9.0: STRONG BUY, >=7.0: BUY, >=4.0: HOLD).
-        * **External Consensus:** Sourced from public analyst consensus data (e.g., Yahoo Finance, which aggregates data from various agencies).
+        **Recommendation Sources:**
+        * **App Recommendation:** Based on 40/40/20 Model Score (≥9.0: STRONG BUY, ≥7.0: BUY, ≥4.0: HOLD).
+        * **YF Consensus:** Yahoo Finance aggregated recommendation from various data providers.
+        * **Analyst Consensus:** Weighted average from recent analyst ratings (last 3 months).
     """)
     
-    # --- 2. Detailed Stock Analysis & Radar Chart ---
-    st.header("2. Detailed Analysis")
+    # --- 2. Detailed Stock Analysis with Analyst Ratings & News ---
+    st.header("2. Detailed Analysis with Expert Insights")
     selected_ticker = st.selectbox("Select a Ticker for Detailed View", scored_df.index)
     
     if selected_ticker:
-        st.subheader(f"Analysis for {selected_ticker} ({scored_df.loc[selected_ticker, 'Sector']})")
+        company_name = scored_df.loc[selected_ticker, 'Company_Name']
+        st.subheader(f"Analysis for {selected_ticker} - {company_name}")
+        st.caption(f"Sector: {scored_df.loc[selected_ticker, 'Sector']}")
         
-        col1, col2 = st.columns([1, 1])
+        # Create tabs for different sections
+        tab1, tab2, tab3, tab4 = st.tabs(["📊 Scores & Metrics", "👥 Analyst Ratings", "📰 Latest News", "📈 Visual Analysis"])
+        
+        # TAB 1: Scores & Metrics
+        with tab1:
+            col1, col2 = st.columns([1, 1])
 
-        with col1:
-            st.markdown("### 📊 Scoring Breakdown")
+            with col1:
+                st.markdown("### 📊 Scoring Breakdown")
+                
+                detail_data = {
+                    "Total Score (0-10)": formatted_df.loc[selected_ticker, 'Total Score (0-10)'],
+                    "App Recommendation": formatted_df.loc[selected_ticker, 'App Recommendation'],
+                    "YF Consensus": formatted_df.loc[selected_ticker, 'YF Consensus'],
+                    "Analyst Consensus": formatted_df.loc[selected_ticker, 'Analyst Consensus'],
+                    "--- SCORE BREAKDOWN ---": "",
+                    "Fundamental Strength (0-4)": formatted_df.loc[selected_ticker, 'Fund. Score (0-4)'],
+                    "Technical Momentum (0-4)": formatted_df.loc[selected_ticker, 'Tech. Score (0-4)'],
+                    "Sector & Risk (0-2)": formatted_df.loc[selected_ticker, 'Risk Score (0-2)'],
+                }
+                detail_df = pd.DataFrame(detail_data.items(), columns=['Metric', 'Value'])
+                detail_df = detail_df.set_index('Metric')
+                st.table(detail_df)
+                
+            with col2:
+                st.markdown("### 📈 Key Raw Metrics")
+                
+                current_price = scored_df.loc[selected_ticker, 'CurrentPrice']
+                target_mean = scored_df.loc[selected_ticker, 'Target_Mean']
+                upside = scored_df.loc[selected_ticker, 'Upside_Potential']
+                
+                raw_metrics = {
+                    "Current Price": f"₹{current_price:,.2f}",
+                    "Target Price (Mean)": f"₹{target_mean:,.2f}" if not pd.isna(target_mean) else 'N/A',
+                    "Upside Potential": f"{upside:.1f}%" if not pd.isna(upside) else 'N/A',
+                    "--- FUNDAMENTALS ---": "",
+                    "P/E Ratio": f"{scored_df.loc[selected_ticker, 'PE_Ratio']:.2f}" if not pd.isna(scored_df.loc[selected_ticker, 'PE_Ratio']) else 'N/A',
+                    "ROE": f"{(scored_df.loc[selected_ticker, 'ROE'] * 100):.2f}%" if not pd.isna(scored_df.loc[selected_ticker, 'ROE']) else 'N/A',
+                    "D/E Ratio": f"{scored_df.loc[selected_ticker, 'DebtToEquity']:.2f}" if not pd.isna(scored_df.loc[selected_ticker, 'DebtToEquity']) else 'N/A',
+                    "--- TECHNICALS ---": "",
+                    "1Y Price Change": f"{(scored_df.loc[selected_ticker, '1Y_Change'] * 100):.2f}%",
+                    "RSI (14)": f"{scored_df.loc[selected_ticker, 'RSI']:.2f}",
+                    "Beta": f"{scored_df.loc[selected_ticker, 'Beta']:.2f}" if not pd.isna(scored_df.loc[selected_ticker, 'Beta']) else 'N/A',
+                }
+                raw_df = pd.DataFrame(raw_metrics.items(), columns=['Metric', 'Value'])
+                raw_df = raw_df.set_index('Metric')
+                st.table(raw_df)
+        
+        # TAB 2: Analyst Ratings
+        with tab2:
+            analyst_ratings = scored_df.loc[selected_ticker, 'Analyst_Ratings']
             
-            detail_data = {
-                "Total Score (0-10)": formatted_df.loc[selected_ticker, 'Total Score (0-10)'],
-                "App Recommendation": formatted_df.loc[selected_ticker, 'App Recommendation'],
-                "External Consensus": formatted_df.loc[selected_ticker, 'External Consensus'],
-                "--- SCORE BREAKDOWN ---": "",
-                "Fundamental Strength (0-4)": formatted_df.loc[selected_ticker, 'Fund. Score (0-4)'],
-                "Technical Momentum (0-4)": formatted_df.loc[selected_ticker, 'Tech. Score (0-4)'],
-                "Sector & Risk (0-2)": formatted_df.loc[selected_ticker, 'Risk Score (0-2)'],
-            }
-            detail_df = pd.DataFrame(detail_data.items(), columns=['Metric', 'Value'])
-            detail_df = detail_df.set_index('Metric')
-            st.table(detail_df)
+            if isinstance(analyst_ratings, dict) and analyst_ratings['total_analysts'] > 0:
+                st.markdown("### 👥 Analyst Ratings Breakdown")
+                
+                col1, col2 = st.columns([2, 1])
+                
+                with col1:
+                    st.plotly_chart(create_analyst_distribution_chart(analyst_ratings), use_container_width=True)
+                
+                with col2:
+                    st.markdown("#### 📊 Rating Summary")
+                    
+                    # Consensus with color coding
+                    consensus = analyst_ratings['consensus']
+                    if consensus == 'STRONG BUY':
+                        consensus_color = '🟢'
+                    elif consensus == 'BUY':
+                        consensus_color = '🟡'
+                    elif consensus == 'HOLD':
+                        consensus_color = '🟠'
+                    else:
+                        consensus_color = '🔴'
+                    
+                    st.metric("Consensus Rating", f"{consensus_color} {consensus}")
+                    st.metric("Weighted Score", f"{analyst_ratings['weighted_score']:.2f} / 5.0")
+                    st.metric("Total Analysts", analyst_ratings['total_analysts'])
+                    
+                    st.markdown("---")
+                    st.markdown("#### 📋 Distribution")
+                    st.write(f"**Strong Buy:** {analyst_ratings['strong_buy']}")
+                    st.write(f"**Buy:** {analyst_ratings['buy']}")
+                    st.write(f"**Hold:** {analyst_ratings['hold']}")
+                    st.write(f"**Sell:** {analyst_ratings['sell']}")
+                    st.write(f"**Strong Sell:** {analyst_ratings['strong_sell']}")
+                
+                # Target Price Analysis
+                st.markdown("---")
+                st.markdown("### 🎯 Target Price Analysis")
+                
+                col1, col2, col3, col4 = st.columns(4)
+                
+                target_low = scored_df.loc[selected_ticker, 'Target_Low']
+                target_high = scored_df.loc[selected_ticker, 'Target_High']
+                
+                with col1:
+                    st.metric("Current Price", f"₹{current_price:,.2f}")
+                with col2:
+                    st.metric("Target Low", f"₹{target_low:,.2f}" if not pd.isna(target_low) else 'N/A')
+                with col3:
+                    st.metric("Target Mean", f"₹{target_mean:,.2f}" if not pd.isna(target_mean) else 'N/A')
+                with col4:
+                    st.metric("Target High", f"₹{target_high:,.2f}" if not pd.isna(target_high) else 'N/A')
+                
+                if not pd.isna(upside):
+                    if upside > 0:
+                        st.success(f"📈 Potential upside of **{upside:.1f}%** based on mean analyst target price")
+                    else:
+                        st.warning(f"📉 Current price is **{abs(upside):.1f}%** above mean analyst target price")
+                        
+            else:
+                st.info("No analyst ratings data available for this stock.")
+        
+        # TAB 3: Latest News
+        with tab3:
+            news_items = scored_df.loc[selected_ticker, 'News']
             
-        with col2:
-            st.markdown("### 📈 Key Raw Metrics")
-            raw_metrics = {
-                "P/E Ratio": scored_df.loc[selected_ticker, 'PE_Ratio'].round(2),
-                "ROE": f"{(scored_df.loc[selected_ticker, 'ROE'] * 100):.2f}%",
-                "D/E Ratio": scored_df.loc[selected_ticker, 'DebtToEquity'].round(2),
-                "1Y Price Change": f"{(scored_df.loc[selected_ticker, '1Y_Change'] * 100):.2f}%",
-                "RSI (14)": scored_df.loc[selected_ticker, 'RSI'].round(2),
-                "Beta": scored_df.loc[selected_ticker, 'Beta'].round(2),
-            }
-            raw_df = pd.DataFrame(raw_metrics.items(), columns=['Metric', 'Value'])
-            raw_df = raw_df.set_index('Metric')
-            st.table(raw_df)
+            if news_items and len(news_items) > 0:
+                st.markdown("### 📰 Latest News & Market Insights")
+                st.caption("Recent news articles and analysis from various sources")
+                
+                for i, news in enumerate(news_items, 1):
+                    with st.expander(f"📌 {news['title']}", expanded=(i==1)):
+                        col1, col2 = st.columns([3, 1])
+                        with col1:
+                            st.markdown(f"**Publisher:** {news['publisher']}")
+                            st.markdown(f"**Published:** {news['published']}")
+                        with col2:
+                            st.markdown(f"[🔗 Read Article]({news['link']})")
+                        
+                st.markdown("---")
+                st.info("💡 **Tip:** News sentiment and expert opinions can provide valuable context alongside quantitative metrics.")
+            else:
+                st.info("No recent news available for this stock.")
+        
+        # TAB 4: Visual Analysis
+        with tab4:
+            st.markdown("### 🎯 Stock vs. Sector Average Comparison (Radar Chart)")
+            st.plotly_chart(create_radar_chart(scored_df, selected_ticker), use_container_width=True)
             
-        st.markdown("---")
-        st.markdown("### 🎯 Stock vs. Sector Average Comparison (Radar Chart)")
-        st.plotly_chart(create_radar_chart(scored_df, selected_ticker), use_container_width=True)
+            st.markdown("---")
+            st.markdown("### 📊 Recommendation Comparison")
+            
+            # Create a comparison table
+            rec_comparison = pd.DataFrame({
+                'Source': ['App Model', 'Yahoo Finance', 'Analyst Consensus'],
+                'Recommendation': [
+                    scored_df.loc[selected_ticker, 'Balanced_Recommendation'],
+                    scored_df.loc[selected_ticker, 'External_Recommendation'],
+                    analyst_ratings['consensus'] if isinstance(analyst_ratings, dict) else 'N/A'
+                ],
+                'Basis': [
+                    '40/40/20 Quantitative Model',
+                    'Aggregated Data Provider Consensus',
+                    f"{analyst_ratings['total_analysts']} Analyst Ratings" if isinstance(analyst_ratings, dict) else 'N/A'
+                ]
+            })
+            
+            st.dataframe(rec_comparison, use_container_width=True, hide_index=True)
+            
+            st.markdown("""
+            **Interpretation Guide:**
+            - **Strong Agreement:** All sources align → Higher confidence
+            - **Moderate Agreement:** 2 out of 3 align → Moderate confidence  
+            - **Disagreement:** Sources diverge → Consider multiple perspectives
+            """)
 
-
-    # --- 3. Backtesting Summary (Displayed at the bottom, optional) ---
+    # --- 3. Backtesting Summary ---
     st.header("3. Backtesting Performance (STRONG BUY Picks)")
     backtest_summary = run_backtest_summary()
     
     if backtest_summary is not None:
-        st.markdown("Metrics show the **Mean** and **Median** returns of historical picks after 30 and 90 days:")
+        st.markdown("Historical performance of 'STRONG BUY' recommendations (Mean & Median returns):")
         st.dataframe(backtest_summary, use_container_width=True)
+        st.caption("⚠️ Past performance does not guarantee future results. Use as one of many decision factors.")
     else:
-        st.info("No historical 'STRONG BUY' picks are currently old enough (>= 30 days) to run backtesting.")
+        st.info("No historical 'STRONG BUY' picks are currently old enough (≥ 30 days) to run backtesting.")
 
-
-# ----------------------------------------------------------------------
 # --- 7. Main Execution ---
 
 def main():
@@ -548,6 +840,39 @@ def main():
     
     if not tickers:
         st.info("👈 Please select stocks in the sidebar to run the analysis.")
+        st.markdown("---")
+        st.markdown("""
+        ### 🎯 What's New in V3.3?
+        
+        This enhanced version includes:
+        
+        1. **📊 Weighted Analyst Ratings**
+           - Aggregates recommendations from multiple analysts
+           - Calculates consensus ratings (Strong Buy to Strong Sell)
+           - Shows rating distribution and weighted scores
+        
+        2. **🎯 Target Price Analysis**
+           - Displays analyst target prices (Low, Mean, High)
+           - Calculates potential upside/downside
+           - Compares current price against analyst expectations
+        
+        3. **📰 Latest News Integration**
+           - Fetches recent news articles about selected stocks
+           - Shows publisher, publication date, and article links
+           - Provides market context and expert opinions
+        
+        4. **🔍 Multi-Source Recommendations**
+           - App's quantitative model (40/40/20 weighting)
+           - Yahoo Finance consensus
+           - Analyst consensus from recent ratings
+        
+        5. **📈 Enhanced Visualizations**
+           - Analyst rating distribution charts
+           - Recommendation comparison tables
+           - Interactive tabs for organized information
+        
+        Select stocks from the sidebar to begin your analysis!
+        """)
         return
     
     # 2. Fetch Data
@@ -561,7 +886,7 @@ def main():
     metrics_df = compute_all_metrics(raw_data)
     scored_df = calculate_kpis_and_total_score(metrics_df)
 
-    # 5. Display results (Scores and Recommendations)
+    # 5. Display results
     results_page(scored_df)
 
 if __name__ == "__main__":
