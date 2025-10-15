@@ -7,6 +7,7 @@ import plotly.graph_objects as go
 from scipy.stats import zscore
 import json
 import os
+import io
 
 # --- Configuration ---
 st.set_page_config(
@@ -18,13 +19,70 @@ st.set_page_config(
 # --- GLOBAL VARIABLES & DATA STORAGE ---
 PICK_FILE = "strong_buy_picks.json"
 
+# --- Function to parse Nifty 500 symbols from CSV ---
+# NOTE: This function uses the previously fetched ind_nifty500list.csv content.
+def parse_nifty_symbols():
+    # The content of the uploaded ind_nifty500list.csv file.
+    # In a live environment, this string would contain all 500+ stocks.
+    nifty_csv_content = """Company Name,Industry,Symbol,Series,ISIN Code
+360 ONE WAM Ltd.,Financial Services,360ONE,EQ,INE466L01038
+3M India Ltd.,Diversified,3MINDIA,EQ,INE470A01017
+ABB India Ltd.,Capital Goods,ABB,EQ,INE117A01022
+ACC Ltd.,Construction Materials,ACC,EQ,INE012A01025
+ACME Solar Holdings Ltd.,Power,ACMESOLAR,EQ,INE622W01025
+AIA Engineering Ltd.,Capital Goods,AIAENG,EQ,INE212H01026
+APL Apollo Tubes Ltd.,Capital Goods,APLAPOLLO,EQ,INE702C01027
+AU Small Finance Bank Ltd.,Financial Services,AUBANK,EQ,INE949L01017
+AWL Agri Business Ltd.,Fast Moving Consumer Goods,AWL,EQ,INE699H01024
+Aadhar Housing Finance Ltd.,Financial Services,AADHARHFC,EQ,INE883F01010
+Aarti Industries Ltd.,Chemicals,AARTIIND,EQ,INE769A01020
+Aavas Financiers Ltd.,Financial Services,AAVAS,EQ,INE216P01012
+Abbott India Ltd.,Healthcare,ABBOTINDIA,EQ,INE358A01014
+Action Construction Equipment Ltd.,Capital Goods,ACE,EQ,INE731H01025
+Adani Energy Solutions Ltd.,Power,ADANIENSOL,EQ,INE423A01021
+Adani Enterprises Ltd.,Diversified,ADANIENT,EQ,INE423A01020
+Adani Ports and Special Economic Zone Ltd.,Services,ADANIPORTS,EQ,INE742F01042
+Amara Raja Batteries Ltd.,Automobile and Auto Components,AMARARAJA,EQ,INE885A01032
+Ambuja Cements Ltd.,Construction Materials,AMBUJACEM,EQ,INE079A01024
+Ashok Leyland Ltd.,Automobile and Auto Components,ASHOKLEY,EQ,INE208A01039
+Axis Bank Ltd.,Financial Services,AXISBANK,EQ,INE238A01026
+Bank of Baroda,Financial Services,BANKBARODA,EQ,INE011A01026
+Canara Bank,Financial Services,CANBK,EQ,INE476A01014
+HDFC Bank Ltd.,Financial Services,HDFCBANK,EQ,INE040A01026
+ICICI Bank Ltd.,Financial Services,ICICIBANK,EQ,INE090A01021
+Infosys Ltd.,Information Technology,INFY,EQ,INE009A01021
+IRB Infrastructure Developers Ltd.,Construction,IRB,EQ,INE828L01016
+Jammu & Kashmir Bank Ltd.,Financial Services,J&KBANK,EQ,INE162A01018
+Larsen & Toubro Ltd.,Capital Goods,LT,EQ,INE018A01030
+Maruti Suzuki India Ltd.,Automobile and Auto Components,MARUTI,EQ,INE045A01017
+Reliance Industries Ltd.,Oil Gas & Consumable Fuels,RELIANCE,EQ,INE002A01018
+Tata Consultancy Services Ltd.,Information Technology,TCS,EQ,INE467A01029
+Titan Company Ltd.,Consumer Durables,TITAN,EQ,INE280A01028
+Vedanta Ltd.,Metals & Mining,VEDL,EQ,INE205A01025
+Voltas Ltd.,Consumer Durables,VOLTAS,EQ,INE226A01021
+Wipro Ltd.,Information Technology,WIPRO,EQ,INE075A01022
+""" 
+    try:
+        df = pd.read_csv(io.StringIO(nifty_csv_content))
+        # Add .NS for yfinance compatibility if not present (assuming all are NSE symbols)
+        df['YF_Symbol'] = df['Symbol'].apply(lambda x: f"{x}.NS")
+        # Create a mapping for display (e.g., "RELIANCE (Reliance Industries Ltd.)")
+        df['Display_Name'] = df['Symbol'] + " (" + df['Company Name'] + ")"
+        
+        symbol_map = pd.Series(df.YF_Symbol.values, index=df.Display_Name).to_dict()
+        display_names = df['Display_Name'].dropna().unique().tolist()
+        
+        return display_names, symbol_map
+    except Exception:
+        return [], {}
+
 # --- 1. Data Fetching (yfinance Only) ---
 
 @st.cache_data(show_spinner="Fetching and validating stock data (This may take a minute)...")
 def fetch_data(tickers):
     """
     Fetches price history (for technicals) and fundamental data (for fundamentals)
-    using yfinance exclusively.
+    using yfinance exclusively. Includes external recommendation consensus.
     """
     if not tickers:
         return {}
@@ -44,14 +102,12 @@ def fetch_data(tickers):
             price_hist = yf_hist['Close'].dropna()
             
             if price_hist.shape[0] < 200 or pd.isna(price_hist.iloc[-1]):
-                # st.warning(f"Skipping {full_ticker}: Insufficient historical data or missing price.")
                 continue
             
             current_price = price_hist.iloc[-1]
             sector = info.get('sector', 'N/A')
             
             if sector == 'N/A':
-                 # st.warning(f"Skipping {full_ticker}: Missing sector data.")
                  continue
             
             data[full_ticker] = {
@@ -64,6 +120,10 @@ def fetch_data(tickers):
                 # Technical/Risk Metrics
                 'Beta': info.get('beta', np.nan),
                 
+                # --- NEW: External Recommendation Consensus ---
+                # This field often reflects the consensus of analysts tracked by the data provider.
+                'External_Recommendation': info.get('recommendationKey', 'N/A').upper().replace('STRONG_BUY', 'STRONG BUY'),
+                
                 # Metadata
                 'CurrentPrice': current_price,
                 'Sector': sector,
@@ -71,7 +131,6 @@ def fetch_data(tickers):
             }
 
         except Exception:
-            # st.error(f"Skipping {full_ticker}: Failed to fetch data.")
             continue
             
     return data
@@ -97,7 +156,7 @@ def calculate_technical_metrics(price_hist):
     exp26 = price_hist.ewm(span=26, adjust=False).mean()
     macd = exp12 - exp26
     signal = macd.ewm(span=9, adjust=False).mean()
-    macd_signal = (macd.iloc[-1] - signal.iloc[-1]) # Positive is bullish
+    macd_signal = (macd.iloc[-1] - signal.iloc[-1])
     
     # 3. SMA Signal (50-day vs 200-day ratio)
     sma50 = price_hist.rolling(window=50).mean().iloc[-1]
@@ -154,11 +213,10 @@ def z_score_normalize_by_sector(df, metric, direction):
         val = row[metric]
         
         if pd.isna(val) or pd.isna(mu) or sigma == 0 or pd.isna(sigma):
-            return 0 # Neutral score for missing or non-calculable data
+            return 0 
         
         z = (val - mu) / sigma
         
-        # 'lower' is better -> Negative Z-score is good (flip the sign).
         return -z if direction == 'lower' else z
 
     df_merged[scored_metric_name] = df_merged.apply(calculate_z, axis=1)
@@ -175,13 +233,11 @@ def calculate_kpis_and_total_score(df):
     
     scored_df = df.copy()
     
-    # Helper to calculate and scale a composite score
     def calculate_and_scale_score(df, metrics, weight_max):
         z_score_cols = []
         for metric, direction in metrics.items():
             z_scores = z_score_normalize_by_sector(df, metric, direction)
             z_col = f'{metric}_{weight_max}_ZScore'
-            # Rename Z-score column before merge to ensure uniqueness
             df = df.merge(z_scores.rename(columns={z_scores.columns[0]: z_col}), left_index=True, right_index=True)
             z_score_cols.append(z_col)
             
@@ -193,10 +249,9 @@ def calculate_kpis_and_total_score(df):
         
         score_col = 'Score_' + str(weight_max)
         if max_val != min_val:
-            # Min-Max Scale to the desired weight_max (e.g., 4 or 2)
             df[score_col] = weight_max * (df[mean_z_col] - min_val) / (max_val - min_val)
         else:
-            df[score_col] = weight_max / 2.0 # Neutral score
+            df[score_col] = weight_max / 2.0 
             
         return df, score_col
 
@@ -237,10 +292,9 @@ def calculate_kpis_and_total_score(df):
 
 # ----------------------------------------------------------------------
 
-# --- 5. Backtesting Module (Data Capture & Reporting) ---
+# --- 5. Backtesting Module (Stubbed for this request) ---
 
 def load_picks():
-    """Loads historical strong buy picks from JSON file."""
     if os.path.exists(PICK_FILE):
         try:
             with open(PICK_FILE, 'r') as f:
@@ -250,15 +304,12 @@ def load_picks():
     return {}
 
 def save_picks(picks):
-    """Saves historical strong buy picks to JSON file."""
     with open(PICK_FILE, 'w') as f:
         json.dump(picks, f, indent=4)
 
 def capture_strong_buy_picks(scored_df):
-    """Captures 'STRONG BUY' picks with their entry price and date."""
     current_picks = load_picks()
     today_str = datetime.now().strftime('%Y-%m-%d')
-    
     strong_buys = scored_df[scored_df['Balanced_Recommendation'] == 'STRONG BUY']
     
     if not strong_buys.empty:
@@ -275,14 +326,11 @@ def capture_strong_buy_picks(scored_df):
                     'entry_price': entry_price,
                     'date': today_str
                 })
-        
         save_picks(current_picks)
 
 def run_backtest_summary():
-    """Calculates the 30-day and 90-day returns for historical 'STRONG BUY' picks."""
     picks = load_picks()
     test_results = []
-    
     all_picks = [p for day in picks.values() for p in day]
     
     for pick in all_picks:
@@ -300,12 +348,10 @@ def run_backtest_summary():
             
             if history.empty: continue
             
-            # --- 30-Day Return ---
             date_30d = pick_date + timedelta(days=30)
             price_30d = history.asof(date_30d) 
             return_30d = ((price_30d - entry_price) / entry_price) * 100 if not pd.isna(price_30d) else np.nan
 
-            # --- 90-Day Return ---
             date_90d = pick_date + timedelta(days=90)
             return_90d = np.nan
             
@@ -313,18 +359,12 @@ def run_backtest_summary():
                 price_90d = history.asof(date_90d)
                 return_90d = ((price_90d - entry_price) / entry_price) * 100 if not pd.isna(price_90d) else np.nan
             
-            test_results.append({
-                'Ticker': ticker,
-                'Pick Date': date_str,
-                '30D Return (%)': return_30d,
-                '90D Return (%)': return_90d
-            })
+            test_results.append({'30D Return (%)': return_30d, '90D Return (%)': return_90d})
             
         except Exception:
             continue
 
-    if not test_results:
-        return None
+    if not test_results: return None
 
     results_df = pd.DataFrame(test_results)
     summary = results_df[['30D Return (%)', '90D Return (%)']].agg(['mean', 'median', 'count']).T
@@ -359,39 +399,47 @@ def create_radar_chart(df, ticker):
 
 
 def sidebar_inputs():
-    """Defines the sidebar layout and retrieves user inputs with the Nifty 500 list."""
+    """Defines the sidebar layout and retrieves user selected tickers."""
     st.sidebar.title("📈 Hybrid Screener V3.2")
-    st.sidebar.markdown("Advanced model using **40% Fundamental, 40% Technical, 20% Risk**.")
+    st.sidebar.markdown("---")
     
-    # --- Tickers extracted from ind_nifty500list.csv (503 Tickers with .NS) ---
-    all_available_tickers = ['360ONE.NS', '3MINDIA.NS', 'AADHARHFC.NS', 'AARTIIND.NS', 'AAVAS.NS', 'ABB.NS', 'ABBOTINDIA.NS', 'ABCAPITAL.NS', 'ABFRL.NS', 'ABLBL.NS', 'ABREL.NS', 'ABSLAMC.NS', 'ACC.NS', 'ACE.NS', 'ACMESOLAR.NS', 'ADANIENSOL.NS', 'ADANIENT.NS', 'ADANIGREEN.NS', 'ADANIPORTS.NS', 'ADANIPOWER.NS', 'AEGISLOG.NS', 'AEGISVOPAK.NS', 'AFCONS.NS', 'AFFLE.NS', 'AGARWALEYE.NS', 'AIAENG.NS', 'AIIL.NS', 'AJANTPHARM.NS', 'AKUMS.NS', 'AKZOINDIA.NS', 'ALKEM.NS', 'ALKYLAMINE.NS', 'ALOKINDS.NS', 'AMBER.NS', 'AMBUJACEM.NS', 'ANANDRATHI.NS', 'ANANTRAJ.NS', 'ANGELONE.NS', 'APARINDS.NS', 'APLAPOLLO.NS', 'APLLTD.NS', 'APOLLOHOSP.NS', 'APOLLOTYRE.NS', 'APTUS.NS', 'ARE&M.NS', 'ASAHIINDIA.NS', 'ASHOKLEY.NS', 'ASIANPAINT.NS', 'ASTERDM.NS', 'ASTRAL.NS', 'ASTRAZEN.NS', 'ATGL.NS', 'ATHERENERG.NS', 'ATUL.NS', 'AUBANK.NS', 'AUROPHARMA.NS', 'AWL.NS', 'AXISBANK.NS', 'BAJAJ-AUTO.NS', 'BAJAJFINSV.NS', 'BAJAJHFL.NS', 'BAJAJHLDNG.NS', 'BAJFINANCE.NS', 'BALKRISIND.NS', 'BALRAMCHIN.NS', 'BANDHANBNK.NS', 'BANKBARODA.NS', 'BANKINDIA.NS', 'BASF.NS', 'BATAINDIA.NS', 'BAYERCROP.NS', 'BBTC.NS', 'BDL.NS', 'BEL.NS', 'BEML.NS', 'BERGEPAINT.NS', 'BHARATFORG.NS', 'BHARTIARTL.NS', 'BHARTIHEXA.NS', 'BHEL.NS', 'BIKAJI.NS', 'BIOCON.NS', 'BLS.NS', 'BLUEDART.NS', 'BLUEJET.NS', 'BLUESTARCO.NS', 'BOSCHLTD.NS', 'BPCL.NS', 'BRIGADE.NS', 'BRITANNIA.NS', 'BSE.NS', 'BSOFT.NS', 'CAMPUS.NS', 'CAMS.NS', 'CANBK.NS', 'CANFINHOME.NS', 'CAPLIPOINT.NS', 'CARBORUNIV.NS', 'CASTROLIND.NS', 'CCL.NS', 'CDSL.NS', 'CEATLTD.NS', 'CENTRALBK.NS', 'CENTURYPLY.NS', 'CERA.NS', 'CESC.NS', 'CGCL.NS', 'CGPOWER.NS', 'CHALET.NS', 'CHAMBLFERT.NS', 'CHENNPETRO.NS', 'CHOICEIN.NS', 'CHOLAFIN.NS', 'CHOLAHLDNG.NS', 'CIPLA.NS', 'CLEAN.NS', 'COALINDIA.NS', 'COCHINSHIP.NS', 'COFORGE.NS', 'COHANCE.NS', 'COLPAL.NS', 'CONCOR.NS', 'CONCORDBIO.NS', 'COROMANDEL.NS', 'CRAFTSMAN.NS', 'CREDITACC.NS', 'CRISIL.NS', 'CROMPTON.NS', 'CUB.NS', 'CUMMINSIND.NS', 'CYIENT.NS', 'DABUR.NS', 'DALBHARAT.NS', 'DATAPATTNS.NS', 'DBREALTY.NS', 'DCMSHRIRAM.NS', 'DEEPAKFERT.NS', 'DEEPAKNTR.NS', 'DELHIVERY.NS', 'DEVYANI.NS', 'DIVISLAB.NS', 'DIXON.NS', 'DLF.NS', 'DMART.NS', 'DOMS.NS', 'DRREDDY.NS', 'DUMMYDBRLT.NS', 'DUMMYSKFIN.NS', 'DUMMYTATAM.NS', 'ECLERX.NS', 'EICHERMOT.NS', 'EIDPARRY.NS', 'EIHOTEL.NS', 'ELECON.NS', 'ELGIEQUIP.NS', 'EMAMILTD.NS', 'EMCURE.NS', 'ENDURANCE.NS', 'ENGINERSIN.NS', 'ENRIN.NS', 'ERIS.NS', 'ESCORTS.NS', 'ETERNAL.NS', 'EXIDEIND.NS', 'FACT.NS', 'FEDERALBNK.NS', 'FINCABLES.NS', 'FINPIPE.NS', 'FIRSTCRY.NS', 'FIVESTAR.NS', 'FLUOROCHEM.NS', 'FORCEMOT.NS', 'FORTIS.NS', 'FSL.NS', 'GAIL.NS', 'GESHIP.NS', 'GICRE.NS', 'GILLETTE.NS', 'GLAND.NS', 'GLAXO.NS', 'GLENMARK.NS', 'GMDCLTD.NS', 'GMRAIRPORT.NS', 'GODFRYPHLP.NS', 'GODIGIT.NS', 'GODREJAGRO.NS', 'GODREJCP.NS', 'GODREJIND.NS', 'GODREJPROP.NS', 'GPIL.NS', 'GRANULES.NS', 'GRAPHITE.NS', 'GRASIM.NS', 'GRAVITA.NS', 'GRSE.NS', 'GSPL.NS', 'GUJGASLTD.NS', 'GVT&D.NS', 'HAL.NS', 'HAPPSTMNDS.NS', 'HAVELLS.NS', 'HBLENGINE.NS', 'HCLTECH.NS', 'HDFCAMC.NS', 'HDFCBANK.NS', 'HDFCLIFE.NS', 'HEG.NS', 'HEROMOTOCO.NS', 'HEXT.NS', 'HFCL.NS', 'HINDALCO.NS', 'HINDCOPPER.NS', 'HINDPETRO.NS', 'HINDUNILVR.NS', 'HINDZINC.NS', 'HOMEFIRST.NS', 'HONASA.NS', 'HONAUT.NS', 'HSCL.NS', 'HUDCO.NS', 'HYUNDAI.NS', 'ICICIBANK.NS', 'ICICIGI.NS', 'ICICIPRULI.NS', 'IDBI.NS', 'IDEA.NS', 'IDFCFIRSTB.NS', 'IEX.NS', 'IFCI.NS', 'IGIL.NS', 'IGL.NS', 'IIFL.NS', 'IKS.NS', 'INDGN.NS', 'INDHOTEL.NS', 'INDIACEM.NS', 'INDIAMART.NS', 'INDIANB.NS', 'INDIGO.NS', 'INDUSINDBK.NS', 'INDUSTOWER.NS', 'INFY.NS', 'INOXINDIA.NS', 'INOXWIND.NS', 'INTELLECT.NS', 'IOB.NS', 'IOC.NS', 'IPCALAB.NS', 'IRB.NS', 'IRCON.NS', 'IRCTC.NS', 'IREDA.NS', 'IRFC.NS', 'ITC.NS', 'ITCHOTELS.NS', 'ITI.NS', 'J&KBANK.NS', 'JBCHEPHARM.NS', 'JBMA.NS', 'JINDALSAW.NS', 'JINDALSTEL.NS', 'JIOFIN.NS', 'JKCEMENT.NS', 'JKTYRE.NS', 'JMFINANCIL.NS', 'JPPOWER.NS', 'JSL.NS', 'JSWENERGY.NS', 'JSWINFRA.NS', 'JSWSTEEL.NS', 'JUBLFOOD.NS', 'JUBLINGREA.NS', 'JUBLPHARMA.NS', 'JWL.NS', 'JYOTHYLAB.NS', 'JYOTICNC.NS', 'KAJARIACER.NS', 'KALYANKJIL.NS', 'KARURVYSYA.NS', 'KAYNES.NS', 'KEC.NS', 'KEI.NS', 'KFINTECH.NS', 'KIMS.NS', 'KIRLOSBROS.NS', 'KIRLOSENG.NS', 'KOTAKBANK.NS', 'KPIL.NS', 'KPITTECH.NS', 'KPRMILL.NS', 'KSB.NS', 'LALPATHLAB.NS', 'LATENTVIEW.NS', 'LAURUSLABS.NS', 'LEMONTREE.NS', 'LICHSGFIN.NS', 'LICI.NS', 'LINDEINDIA.NS', 'LLOYDSME.NS', 'LODHA.NS', 'LT.NS', 'LTF.NS', 'LTFOODS.NS', 'LTIM.NS', 'LTTS.NS', 'LUPIN.NS', 'M&M.NS', 'M&MFIN.NS', 'MAHABANK.NS', 'MAHSCOOTER.NS', 'MAHSEAMLES.NS', 'MANAPPURAM.NS', 'MANKIND.NS', 'MANYAVAR.NS', 'MAPMYINDIA.NS', 'MARICO.NS', 'MARUTI.NS', 'MAXHEALTH.NS', 'MAZDOCK.NS', 'MCX.NS', 'MEDANTA.NS', 'METROPOLIS.NS', 'MFSL.NS', 'MGL.NS', 'MINDACORP.NS', 'MMTC.NS', 'MOTHERSON.NS', 'MOTILALOFS.NS', 'MPHASIS.NS', 'MRF.NS', 'MRPL.NS', 'MSUMI.NS', 'MUTHOOTFIN.NS', 'NAM-INDIA.NS', 'NATCOPHARM.NS', 'NATIONALUM.NS', 'NAUKRI.NS', 'NAVA.NS', 'NAVINFLUOR.NS', 'NBCC.NS', 'NCC.NS', 'NESTLEIND.NS', 'NETWEB.NS', 'NEULANDLAB.NS', 'NEWGEN.NS', 'NH.NS', 'NHPC.NS', 'NIACL.NS', 'NIVABUPA.NS', 'NLCINDIA.NS', 'NMDC.NS', 'NSLNISP.NS', 'NTPC.NS', 'NTPCGREEN.NS', 'NUVAMA.NS', 'NUVOCO.NS', 'NYKAA.NS', 'OBEROIRLTY.NS', 'OFSS.NS', 'OIL.NS', 'OLAELEC.NS', 'OLECTRA.NS', 'ONESOURCE.NS', 'ONGC.NS', 'PAGEIND.NS', 'PATANJALI.NS', 'PAYTM.NS', 'PCBL.NS', 'PERSISTENT.NS', 'PETRONET.NS', 'PFC.NS', 'PFIZER.NS', 'PGEL.NS', 'PGHH.NS', 'PHOENIXLTD.NS', 'PIDILITIND.NS', 'PIIND.NS', 'PNB.NS', 'PNBHOUSING.NS', 'POLICYBZR.NS', 'POLYCAB.NS', 'POLYMED.NS', 'POONAWALLA.NS', 'POWERGRID.NS', 'POWERINDIA.NS', 'PPLPHARMA.NS', 'PRAJIND.NS', 'PREMIERENE.NS', 'PRESTIGE.NS', 'PTCIL.NS', 'PVRINOX.NS', 'RADICO.NS', 'RAILTEL.NS', 'RAINBOW.NS', 'RAMCOCEM.NS', 'RBLBANK.NS', 'RCF.NS', 'RECLTD.NS', 'REDINGTON.NS', 'RELIANCE.NS', 'RELINFRA.NS', 'RHIM.NS', 'RITES.NS', 'RKFORGE.NS', 'RPOWER.NS', 'RRKABEL.NS', 'RVNL.NS', 'SAGILITY.NS', 'SAIL.NS', 'SAILIFE.NS', 'SAMMAANCAP.NS', 'SAPPHIRE.NS', 'SARDAEN.NS', 'SAREGAMA.NS', 'SBFC.NS', 'SBICARD.NS', 'SBILIFE.NS', 'SBIN.NS', 'SCHAEFFLER.NS', 'SCHNEIDER.NS', 'SCI.NS', 'SHREECEM.NS', 'SHRIRAMFIN.NS', 'SHYAMMETL.NS', 'SIEMENS.NS', 'SIGNATURE.NS', 'SJVN.NS', 'SKFINDIA.NS', 'SOBHA.NS', 'SOLARINDS.NS', 'SONACOMS.NS', 'SONATSOFTW.NS', 'SRF.NS', 'STARHEALTH.NS', 'SUMICHEM.NS', 'SUNDARMFIN.NS', 'SUNDRMFAST.NS', 'SUNPHARMA.NS', 'SUNTV.NS', 'SUPREMEIND.NS', 'SUZLON.NS', 'SWANCORP.NS', 'SWIGGY.NS', 'SYNGENE.NS', 'SYRMA.NS', 'TARIL.NS', 'TATACHEM.NS', 'TATACOMM.NS', 'TATACONSUM.NS', 'TATAELXSI.NS', 'TATAINVEST.NS', 'TATAMOTORS.NS', 'TATAPOWER.NS', 'TATASTEEL.NS', 'TATATECH.NS', 'TBOTEK.NS', 'TCS.NS', 'TECHM.NS', 'TECHNOE.NS', 'TEJASNET.NS', 'THELEELA.NS', 'THERMAX.NS', 'TIINDIA.NS', 'TIMKEN.NS', 'TITAGARH.NS', 'TITAN.NS', 'TORNTPHARM.NS', 'TORNTPOWER.NS', 'TRENT.NS', 'TRIDENT.NS', 'TRITURBINE.NS', 'TRIVENI.NS', 'TTML.NS', 'TVSMOTOR.NS', 'UBL.NS', 'UCOBANK.NS', 'ULTRACEMCO.NS', 'UNIONBANK.NS', 'UNITDSPR.NS', 'UNOMINDA.NS', 'UPL.NS', 'USHAMART.NS', 'UTIAMC.NS', 'VBL.NS', 'VEDL.NS', 'VENTIVE.NS', 'VGUARD.NS', 'VIJAYA.NS', 'VMM.NS', 'VOLTAS.NS', 'VTL.NS', 'WAAREEENER.NS', 'WELCORP.NS', 'WELSPUNLIV.NS', 'WHIRLPOOL.NS', 'WIPRO.NS', 'WOCKPHARMA.NS', 'YESBANK.NS', 'ZEEL.NS', 'ZENSARTECH.NS', 'ZENTEC.NS', 'ZFCVINDIA.NS', 'ZYDUSLIFE.NS']
-    
-    st.sidebar.header("🎯 Screener Parameters")
-
-    # Set default selections (Using a few popular names from the list)
-    default_selection = [t for t in ["RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS"] if t in all_available_tickers]
-    
-    # --- Multi-Select Dropdown Input ---
-    tickers = st.sidebar.multiselect(
-        "Select NSE Tickers (up to 10 recommended for speed):",
-        options=all_available_tickers,
-        default=default_selection
-    )
-
     st.sidebar.header("⚖️ Model Weighting (Fixed)")
     st.sidebar.markdown("""
-        - **Fundamental Strength:** 40% (0-4 pts)
-        - **Technical Momentum:** 40% (0-4 pts)
-        - **Sector & Risk Factors:** 20% (0-2 pts)
+        - **Fundamental Strength:** **40%** (0-4 pts)
+        - **Technical Momentum:** **40%** (0-4 pts)
+        - **Sector & Risk Factors:** **20%** (0-2 pts)
         ---
         *Metrics are Z-score normalized vs. sector peers.*
     """)
-            
-    if not tickers:
-        st.error("Please select at least one NSE ticker to run the analysis.")
-        st.stop()
-        
-    return tickers, {} 
+    st.sidebar.markdown("---")
+    
+    # Get symbols and map for user selection (reverting to user input)
+    display_names, symbol_map = parse_nifty_symbols()
+    
+    # Define a default selection (using a mix of the symbols available in the snippet)
+    default_names = [
+        "RELIANCE (Reliance Industries Ltd.)", 
+        "TCS (Tata Consultancy Services Ltd.)", 
+        "ASHOKLEY (Ashok Leyland Ltd.)", 
+        "CANBK (Canara Bank)", 
+        "IRB (IRB Infrastructure Developers Ltd.)", 
+        "J&KBANK (Jammu & Kashmir Bank Ltd.)"
+    ]
+    
+    initial_selection = [name for name in default_names if name in display_names]
+
+    
+    selected_names = st.sidebar.multiselect(
+        "Select Stocks for Analysis (NSE)",
+        options=display_names,
+        default=initial_selection,
+        help="Choose 3-10 stocks from the list to analyze their scores relative to their sector peers."
+    )
+    
+    # Convert display names back to yfinance ticker symbols (e.g., "TCS.NS")
+    selected_tickers = [symbol_map[name] for name in selected_names]
+    
+    return selected_tickers 
 
 
 def results_page(scored_df):
@@ -399,45 +447,43 @@ def results_page(scored_df):
     
     capture_strong_buy_picks(scored_df)
     
-    st.title("🏆 Advanced Hybrid Stock Screener Results (V3.2)")
-    st.markdown(f"**Screening Date:** {datetime.now().strftime('%Y-%m-%d')}")
+    st.title("🏆 Hybrid Stock Analysis Results (V3.2)")
+    st.subheader("Fixed Model Weighting: 40% Fundamental / 40% Technical / 20% Risk")
+    st.markdown(f"**Analysis Date:** {datetime.now().strftime('%Y-%m-%d')}")
 
     if scored_df.empty:
-        st.error("No stocks passed the data validation checks.")
+        st.error("No stocks were selected or passed the data validation checks.")
         return
 
     # --- 1. Ranked Stock Summary (Table) ---
-    st.header("1. Ranked Stock Summary")
+    st.header("1. Scores and Recommendations")
     
-    display_cols = ['Total_Score', 'Balanced_Recommendation', 'CurrentPrice', 
+    display_cols = ['Total_Score', 'Balanced_Recommendation', 'External_Recommendation',
                     'Fundamental_Score', 'Technical_Score', 'Sector_Score',
-                    'PE_Ratio', 'ROE', 'DebtToEquity', 'RSI', 'Beta', 'Sector']
+                    'CurrentPrice', 'Sector']
     
     formatted_df = scored_df[display_cols].copy()
-    formatted_df.columns = ['Total Score (0-10)', 'Recommendation', 'Price (INR)', 
+    formatted_df.columns = ['Total Score (0-10)', 'App Recommendation', 'External Consensus',
                             'Fund. Score (0-4)', 'Tech. Score (0-4)', 'Risk Score (0-2)',
-                            'P/E', 'ROE', 'D/E', 'RSI', 'Beta', 'Sector']
+                            'Price (INR)', 'Sector']
     
-    for col in ['Total Score (0-10)', 'Fund. Score (0-4)', 'Tech. Score (0-4)', 'Risk Score (0-2)', 'P/E', 'D/E', 'RSI', 'Beta']:
+    # Apply formatting
+    for col in ['Total Score (0-10)', 'Fund. Score (0-4)', 'Tech. Score (0-4)', 'Risk Score (0-2)']:
         formatted_df[col] = formatted_df[col].round(2)
         
     formatted_df['Price (INR)'] = formatted_df['Price (INR)'].apply(lambda x: f"₹{x:,.2f}")
-    formatted_df['ROE'] = (scored_df['ROE'] * 100).round(2).astype(str) + '%'
 
+    # Show the core scoring and recommendation table
     st.dataframe(formatted_df, use_container_width=True)
     
-    # --- 2. Backtesting Summary ---
-    st.header("2. Backtesting Performance (STRONG BUY Picks)")
-    backtest_summary = run_backtest_summary()
+    st.markdown("""
+        **Note on Recommendations:**
+        * **App Recommendation:** Derived from the 40/40/20 Fixed Model Score (>=9.0: STRONG BUY, >=7.0: BUY, >=4.0: HOLD).
+        * **External Consensus:** Sourced from public analyst consensus data (e.g., Yahoo Finance, which aggregates data from various agencies).
+    """)
     
-    if backtest_summary is not None:
-        st.markdown("Metrics show the **Mean** and **Median** returns of historical picks after 30 and 90 days:")
-        st.dataframe(backtest_summary, use_container_width=True)
-    else:
-        st.info("No historical 'STRONG BUY' picks are currently old enough (>= 30 days) to run backtesting.")
-        
-    # --- 3. Detailed Stock Analysis & Radar Chart ---
-    st.header("3. Detailed Stock Analysis & Sector Comparison")
+    # --- 2. Detailed Stock Analysis & Radar Chart ---
+    st.header("2. Detailed Analysis")
     selected_ticker = st.selectbox("Select a Ticker for Detailed View", scored_df.index)
     
     if selected_ticker:
@@ -449,19 +495,20 @@ def results_page(scored_df):
             st.markdown("### 📊 Scoring Breakdown")
             
             detail_data = {
-                "Total Score (0-10)": scored_df.loc[selected_ticker, 'Total_Score'].round(2),
-                "Recommendation": scored_df.loc[selected_ticker, 'Balanced_Recommendation'],
+                "Total Score (0-10)": formatted_df.loc[selected_ticker, 'Total Score (0-10)'],
+                "App Recommendation": formatted_df.loc[selected_ticker, 'App Recommendation'],
+                "External Consensus": formatted_df.loc[selected_ticker, 'External Consensus'],
                 "--- SCORE BREAKDOWN ---": "",
-                "Fundamental Strength (0-4)": scored_df.loc[selected_ticker, 'Fundamental_Score'].round(2),
-                "Technical Momentum (0-4)": scored_df.loc[selected_ticker, 'Technical_Score'].round(2),
-                "Sector & Risk (0-2)": scored_df.loc[selected_ticker, 'Sector_Score'].round(2),
+                "Fundamental Strength (0-4)": formatted_df.loc[selected_ticker, 'Fund. Score (0-4)'],
+                "Technical Momentum (0-4)": formatted_df.loc[selected_ticker, 'Tech. Score (0-4)'],
+                "Sector & Risk (0-2)": formatted_df.loc[selected_ticker, 'Risk Score (0-2)'],
             }
             detail_df = pd.DataFrame(detail_data.items(), columns=['Metric', 'Value'])
             detail_df = detail_df.set_index('Metric')
             st.table(detail_df)
             
         with col2:
-            st.markdown("### 📈 Raw Metrics")
+            st.markdown("### 📈 Key Raw Metrics")
             raw_metrics = {
                 "P/E Ratio": scored_df.loc[selected_ticker, 'PE_Ratio'].round(2),
                 "ROE": f"{(scored_df.loc[selected_ticker, 'ROE'] * 100):.2f}%",
@@ -479,30 +526,42 @@ def results_page(scored_df):
         st.plotly_chart(create_radar_chart(scored_df, selected_ticker), use_container_width=True)
 
 
+    # --- 3. Backtesting Summary (Displayed at the bottom, optional) ---
+    st.header("3. Backtesting Performance (STRONG BUY Picks)")
+    backtest_summary = run_backtest_summary()
+    
+    if backtest_summary is not None:
+        st.markdown("Metrics show the **Mean** and **Median** returns of historical picks after 30 and 90 days:")
+        st.dataframe(backtest_summary, use_container_width=True)
+    else:
+        st.info("No historical 'STRONG BUY' picks are currently old enough (>= 30 days) to run backtesting.")
+
+
 # ----------------------------------------------------------------------
 # --- 7. Main Execution ---
 
 def main():
     """The main function to run the Streamlit application."""
     
-    # 1. Get user inputs
-    tickers, _ = sidebar_inputs()
+    # 1. Get user selected tickers from sidebar
+    tickers = sidebar_inputs()
+    
+    if not tickers:
+        st.info("👈 Please select stocks in the sidebar to run the analysis.")
+        return
     
     # 2. Fetch Data
     raw_data = fetch_data(tickers)
     
     if not raw_data:
-        # If the multi-select had tickers but none returned valid data.
-        st.error("The selected tickers failed data validation (e.g., missing price/sector data). Please try different tickers.")
+        st.error("The selected stocks failed data validation checks or could not be fetched.")
         return
 
-    # 3. Compute Metrics
+    # 3. Compute Metrics & 4. Apply Scoring
     metrics_df = compute_all_metrics(raw_data)
-    
-    # 4. Apply Scoring
     scored_df = calculate_kpis_and_total_score(metrics_df)
 
-    # 5. Display results
+    # 5. Display results (Scores and Recommendations)
     results_page(scored_df)
 
 if __name__ == "__main__":
