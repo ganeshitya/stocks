@@ -2,9 +2,7 @@ streamlit
 yfinance
 pandas
 numpy
-pandas-datareader>=0.10.0
 requests
 ta
 plotly
 scipy
-packaging
